@@ -35,13 +35,18 @@ func NewCatalog(pool *pgxpool.Pool) *Catalog {
 }
 
 func (c *Catalog) CreateBranch(ctx context.Context, name string, parentID *uuid.UUID) (*Branch, error) {
+	id, err := uuid.NewV7()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate UUIDv7: %w", err)
+	}
+
 	query := `
-		INSERT INTO _chuck._chuck_branches (name, parent_id)
-		VALUES ($1, $2)
+		INSERT INTO _chuck._chuck_branches (id, name, parent_id)
+		VALUES ($1, $2, $3)
 		RETURNING id, name, parent_id, status, created_at, ttl_seconds, merge_status
 	`
 
-	row := c.pool.QueryRow(ctx, query, name, parentID)
+	row := c.pool.QueryRow(ctx, query, id, name, parentID)
 	return scanBranch(row)
 }
 
