@@ -34,6 +34,18 @@ func NewOverlayEngine(pool *pgxpool.Pool) *OverlayEngine {
 	return &OverlayEngine{pool: pool}
 }
 
+const upsertQuery = `
+	INSERT INTO _chuck._chuck_overlay (
+		branch_id, table_name, row_id, shard_key, operation, modified_cols, before_values, after_values
+	) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	ON CONFLICT (branch_id, table_name, row_id, shard_key)
+	DO UPDATE SET
+		operation = EXCLUDED.operation,
+		modified_cols = EXCLUDED.modified_cols,
+		before_values = _chuck._chuck_overlay.before_values, -- preserve original before_values
+		after_values = EXCLUDED.after_values
+`
+
 // WriteDelta upserts an overlay delta record into _chuck._chuck_overlay.
 // If a record already exists for the given branch, table, row, and shard key,
 // its original before_values are preserved.
@@ -48,19 +60,7 @@ func (e *OverlayEngine) WriteDelta(
 	beforeValues []byte,
 	afterValues []byte,
 ) error {
-	query := `
-		INSERT INTO _chuck._chuck_overlay (
-			branch_id, table_name, row_id, shard_key, operation, modified_cols, before_values, after_values
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (branch_id, table_name, row_id, shard_key)
-		DO UPDATE SET
-			operation = EXCLUDED.operation,
-			modified_cols = EXCLUDED.modified_cols,
-			before_values = _chuck._chuck_overlay.before_values, -- preserve original before_values
-			after_values = EXCLUDED.after_values
-	`
-
-	_, err := e.pool.Exec(ctx, query,
+	_, err := e.pool.Exec(ctx, upsertQuery,
 		branchID,
 		tableName,
 		rowID,
@@ -72,6 +72,37 @@ func (e *OverlayEngine) WriteDelta(
 	)
 	if err != nil {
 		return fmt.Errorf("failed to write overlay delta: %w", err)
+	}
+	return nil
+}
+
+// BatchWriteDeltas efficiently upserts multiple overlay delta records using pgx.Batch.
+func (e *OverlayEngine) BatchWriteDeltas(ctx context.Context, deltas []*OverlayDelta) error {
+	if len(deltas) == 0 {
+		return nil
+	}
+
+	batch := &pgx.Batch{}
+	for _, d := range deltas {
+		batch.Queue(upsertQuery,
+			d.BranchID,
+			d.TableName,
+			d.RowID,
+			d.ShardKey,
+			d.Operation,
+			d.ModifiedCols,
+			d.BeforeValues,
+			d.AfterValues,
+		)
+	}
+
+	br := e.pool.SendBatch(ctx, batch)
+	defer br.Close()
+
+	for i := 0; i < len(deltas); i++ {
+		if _, err := br.Exec(); err != nil {
+			return fmt.Errorf("batch exec failed at index %d: %w", i, err)
+		}
 	}
 	return nil
 }
@@ -91,26 +122,50 @@ func (e *OverlayEngine) GetDelta(
 	`
 
 	row := e.pool.QueryRow(ctx, query, branchID, tableName, rowID, shardKey)
-	var d OverlayDelta
-	err := row.Scan(
-		&d.BranchID,
-		&d.TableName,
-		&d.RowID,
-		&d.ShardKey,
-		&d.Operation,
-		&d.ModifiedCols,
-		&d.BeforeValues,
-		&d.AfterValues,
-		&d.Seq,
-		&d.CreatedAt,
-	)
+	d, err := scanDelta(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrDeltaNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan overlay delta: %w", err)
 	}
-	return &d, nil
+	return d, nil
+}
+
+// ListDeltasForBranch retrieves all overlay delta records for a branch, ordered by seq ASC.
+// Needed by the merge engine to iterate all deltas when merging.
+func (e *OverlayEngine) ListDeltasForBranch(ctx context.Context, branchID uuid.UUID) ([]*OverlayDelta, error) {
+	query := `
+		SELECT branch_id, table_name, row_id, shard_key, operation, modified_cols, before_values, after_values, seq, created_at
+		FROM _chuck._chuck_overlay
+		WHERE branch_id = $1
+		ORDER BY seq ASC
+	`
+	return e.listDeltas(ctx, query, branchID)
+}
+
+// ListDeltasSince retrieves overlay delta records for a branch with seq > minSeq, ordered by seq ASC.
+// Needed for checkpoint-range diffs.
+func (e *OverlayEngine) ListDeltasSince(ctx context.Context, branchID uuid.UUID, minSeq int64) ([]*OverlayDelta, error) {
+	query := `
+		SELECT branch_id, table_name, row_id, shard_key, operation, modified_cols, before_values, after_values, seq, created_at
+		FROM _chuck._chuck_overlay
+		WHERE branch_id = $1 AND seq > $2
+		ORDER BY seq ASC
+	`
+	return e.listDeltas(ctx, query, branchID, minSeq)
+}
+
+// GetDeltasForTable retrieves all overlay delta records for a specific table within a branch, ordered by seq ASC.
+// Needed by the query rewriter to build the overlay join.
+func (e *OverlayEngine) GetDeltasForTable(ctx context.Context, branchID uuid.UUID, tableName string) ([]*OverlayDelta, error) {
+	query := `
+		SELECT branch_id, table_name, row_id, shard_key, operation, modified_cols, before_values, after_values, seq, created_at
+		FROM _chuck._chuck_overlay
+		WHERE branch_id = $1 AND table_name = $2
+		ORDER BY seq ASC
+	`
+	return e.listDeltas(ctx, query, branchID, tableName)
 }
 
 // DeleteDeltasForBranch removes all overlay delta records associated with a branch ID.
@@ -135,4 +190,49 @@ func (e *OverlayEngine) InjectBranchContext(ctx context.Context, tx pgx.Tx, bran
 		return fmt.Errorf("failed to inject branch context %q: %w", branchName, err)
 	}
 	return nil
+}
+
+func (e *OverlayEngine) listDeltas(ctx context.Context, query string, args ...any) ([]*OverlayDelta, error) {
+	rows, err := e.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query execution failed: %w", err)
+	}
+	defer rows.Close()
+
+	var deltas []*OverlayDelta
+	for rows.Next() {
+		d, err := scanDelta(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan row: %w", err)
+		}
+		deltas = append(deltas, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rows iteration error: %w", err)
+	}
+	return deltas, nil
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanDelta(r rowScanner) (*OverlayDelta, error) {
+	var d OverlayDelta
+	err := r.Scan(
+		&d.BranchID,
+		&d.TableName,
+		&d.RowID,
+		&d.ShardKey,
+		&d.Operation,
+		&d.ModifiedCols,
+		&d.BeforeValues,
+		&d.AfterValues,
+		&d.Seq,
+		&d.CreatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
 }

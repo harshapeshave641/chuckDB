@@ -96,7 +96,65 @@ func TestOverlayEngineLifecycle(t *testing.T) {
 	// Verify after_values are updated!
 	assertJSONEqual(t, afterVal2, d2.AfterValues, "updated after_values")
 
-	// 5. Test InjectBranchContext
+	// 5. Test BatchWriteDeltas
+	batchDeltas := []*engine.OverlayDelta{
+		{
+			BranchID:     branchID,
+			TableName:    tableName,
+			RowID:        102,
+			ShardKey:     shardKey,
+			Operation:    "INSERT",
+			ModifiedCols: []byte(`{"id": 102, "active": true}`),
+			BeforeValues: []byte(`{"id": 102, "active": true}`),
+			AfterValues:  []byte(`{"id": 102, "active": true}`),
+		},
+		{
+			BranchID:     branchID,
+			TableName:    "pricing_models",
+			RowID:        201,
+			ShardKey:     shardKey,
+			Operation:    "UPDATE",
+			ModifiedCols: []byte(`{"price": 99}`),
+			BeforeValues: []byte(`{"id": 201, "price": 50}`),
+			AfterValues:  []byte(`{"id": 201, "price": 99}`),
+		},
+	}
+	if err := eng.BatchWriteDeltas(ctx, batchDeltas); err != nil {
+		t.Fatalf("BatchWriteDeltas failed: %v", err)
+	}
+
+	// 6. Test ListDeltasForBranch
+	allDeltas, err := eng.ListDeltasForBranch(ctx, branchID)
+	if err != nil {
+		t.Fatalf("ListDeltasForBranch failed: %v", err)
+	}
+	if len(allDeltas) != 3 {
+		t.Fatalf("expected 3 deltas for branch, got %d", len(allDeltas))
+	}
+
+	// 7. Test ListDeltasSince (using seq of the first delta)
+	firstSeq := allDeltas[0].Seq
+	recentDeltas, err := eng.ListDeltasSince(ctx, branchID, firstSeq)
+	if err != nil {
+		t.Fatalf("ListDeltasSince failed: %v", err)
+	}
+	if len(recentDeltas) != 2 {
+		t.Fatalf("expected 2 recent deltas, got %d", len(recentDeltas))
+	}
+
+	// 8. Test GetDeltasForTable
+	pricingDeltas, err := eng.GetDeltasForTable(ctx, branchID, "pricing_models")
+	if err != nil {
+		t.Fatalf("GetDeltasForTable failed: %v", err)
+	}
+	if len(pricingDeltas) != 1 {
+		t.Fatalf("expected 1 delta for pricing_models, got %d", len(pricingDeltas))
+	}
+	if pricingDeltas[0].RowID != 201 {
+		t.Errorf("expected rowID 201, got %d", pricingDeltas[0].RowID)
+	}
+
+	// 9. Test InjectBranchContext
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		t.Fatalf("pool.Begin failed: %v", err)
@@ -119,12 +177,12 @@ func TestOverlayEngineLifecycle(t *testing.T) {
 	}
 	_ = tx.Commit(ctx)
 
-	// 6. Test DeleteDeltasForBranch
+	// 10. Test DeleteDeltasForBranch
 	if err := eng.DeleteDeltasForBranch(ctx, branchID); err != nil {
 		t.Fatalf("DeleteDeltasForBranch failed: %v", err)
 	}
 
-	// 7. Verify Deletion
+	// 11. Verify Deletion
 	_, err = eng.GetDelta(ctx, branchID, tableName, rowID, shardKey)
 	if !errors.Is(err, engine.ErrDeltaNotFound) {
 		t.Fatalf("expected ErrDeltaNotFound after delete, got %v", err)
