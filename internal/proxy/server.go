@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -105,11 +104,6 @@ func (s *Server) proxyClientToUpstream(clientConn, upstreamConn net.Conn) {
 			if err := q.Decode(payload); err == nil {
 				stmtType, _ := AnalyzeStatement(q.String)
 				
-				// For MVP, we only rewrite SELECTs.
-				// Mutating queries (INSERT/UPDATE/DELETE) on branched tables are 
-				// complex to intercept accurately without full schema awareness.
-				// We will log a warning if a mutating query hits a branched table in MVP Phase 2.
-				
 				if stmtType == "SELECT" {
 					if rewritten, err := s.rewriter.RewriteSelect(q.String); err == nil {
 						q.String = rewritten
@@ -117,7 +111,6 @@ func (s *Server) proxyClientToUpstream(clientConn, upstreamConn net.Conn) {
 				} else {
 					if targetTable, _ := s.rewriter.MutatesBranchedTable(q.String); targetTable != "" {
 						log.Printf("WARNING: Interception of %s on branched table '%s' is not fully implemented in MVP Phase 2.", stmtType, targetTable)
-						// In a full implementation, we would extract AST values and call s.engine.WriteDelta here.
 					}
 				}
 				
@@ -132,9 +125,6 @@ func (s *Server) proxyClientToUpstream(clientConn, upstreamConn net.Conn) {
 }
 
 func (s *Server) proxyUpstreamToClient(upstreamConn, clientConn net.Conn) {
-	var activeRowDesc *pgproto3.RowDescription
-	var afterValuesIdx int = -1
-
 	for {
 		msgType, payload, err := readMessage(upstreamConn)
 		if err != nil {
@@ -144,29 +134,9 @@ func (s *Server) proxyUpstreamToClient(upstreamConn, clientConn net.Conn) {
 			return
 		}
 
-		if msgType == 'T' {
-			var rd pgproto3.RowDescription
-			if err := rd.Decode(payload); err == nil {
-				idx, m := InterceptRowDescription(&rd)
-				afterValuesIdx = idx
-				activeRowDesc = m
-				b, _ := m.Encode(nil)
-				clientConn.Write(b)
-				continue
-			}
-		} else if msgType == 'D' {
-			if activeRowDesc != nil {
-				var dr pgproto3.DataRow
-				if err := dr.Decode(payload); err == nil {
-					if newDr, err := InterceptDataRow(&dr, activeRowDesc, afterValuesIdx); err == nil {
-						b, _ := newDr.Encode(nil)
-						clientConn.Write(b)
-						continue
-					}
-				}
-			}
-		}
-
+		// Since relational merges are now pushed into SQL via jsonb_populate_record,
+		// there is no need to intercept or decode RowDescription / DataRow packets anymore.
+		// We just blindly forward all bytes upstream -> client!
 		forwardMessage(clientConn, msgType, payload)
 	}
 }
