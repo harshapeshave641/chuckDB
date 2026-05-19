@@ -96,14 +96,29 @@ func (e *OverlayEngine) BatchWriteDeltas(ctx context.Context, deltas []*OverlayD
 		)
 	}
 
-	br := e.pool.SendBatch(ctx, batch)
-	defer br.Close()
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin batch transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	br := tx.SendBatch(ctx, batch)
 
 	for i := 0; i < len(deltas); i++ {
 		if _, err := br.Exec(); err != nil {
+			br.Close()
 			return fmt.Errorf("batch exec failed at index %d: %w", i, err)
 		}
 	}
+	
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("failed to close batch result: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit batch transaction: %w", err)
+	}
+	
 	return nil
 }
 
