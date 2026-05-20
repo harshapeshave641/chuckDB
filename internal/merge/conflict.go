@@ -8,6 +8,7 @@ import (
 
 var (
 	ErrConflictStrict = errors.New("strict merge conflict: base row was modified concurrently")
+	ErrConflictGit    = errors.New("git-style merge conflict: overlapping columns modified concurrently")
 )
 
 // Strategy defines how merge conflicts are handled
@@ -16,6 +17,7 @@ type Strategy string
 const (
 	StrategyStrict        Strategy = "strict"
 	StrategyLastWriteWins Strategy = "last_write_wins"
+	StrategyGitStyle      Strategy = "git_style"
 )
 
 // ResolveConflict takes the current row state from the base table and compares it against the overlay's before_values.
@@ -43,6 +45,22 @@ func ResolveConflict(
 			// Strict mode checks for ANY modification to the base row
 			return nil, fmt.Errorf("%w: columns %v changed", ErrConflictStrict, keys(baseModifiedCols))
 		
+		case StrategyGitStyle:
+			// Git-style mode checks for OVERLAPPING modifications.
+			// If base modified column X, and branch modified column X -> Conflict.
+			// If base modified column X, and branch modified column Y -> Safe to merge.
+			overlapping := []string{}
+			for k := range baseModifiedCols {
+				if _, ok := modifiedCols[k]; ok {
+					overlapping = append(overlapping, k)
+				}
+			}
+			if len(overlapping) > 0 {
+				return nil, fmt.Errorf("%w: overlapping columns %v", ErrConflictGit, overlapping)
+			}
+			// Safe! We just return the branch's modified columns. Base modifications are naturally preserved.
+			return afterValues, nil
+
 		case StrategyLastWriteWins:
 			// In last_write_wins, we just force our after_values over the current base row.
 			// Base modifications to columns we DIDN'T touch are preserved because we only UPDATE modifiedCols.

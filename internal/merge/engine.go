@@ -13,6 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+var ErrRowDeletedConcurrently = fmt.Errorf("row was deleted concurrently")
+
 type MergeEngine struct {
 	pool          *pgxpool.Pool
 	overlayEngine *engine.OverlayEngine
@@ -70,25 +72,52 @@ func (m *MergeEngine) MergeBranch(ctx context.Context, branchID uuid.UUID, strat
 	return tx.Commit(ctx)
 }
 
+func (m *MergeEngine) getPrimaryKeyColumn(ctx context.Context, tx pgx.Tx, tableName string) (string, error) {
+	// Query information_schema for the primary key column
+	query := `
+		SELECT kcu.column_name
+		FROM information_schema.table_constraints tco
+		JOIN information_schema.key_column_usage kcu 
+		  ON kcu.constraint_name = tco.constraint_name
+		  AND kcu.constraint_schema = tco.constraint_schema
+		WHERE tco.constraint_type = 'PRIMARY KEY' 
+		  AND kcu.table_name = $1
+		LIMIT 1
+	`
+	var pkCol string
+	err := tx.QueryRow(ctx, query, tableName).Scan(&pkCol)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			// Fallback to 'id' if no PK is explicitly defined, though real systems should have one.
+			return "id", nil
+		}
+		return "", fmt.Errorf("failed to discover primary key for table %s: %w", tableName, err)
+	}
+	return pkCol, nil
+}
+
 func (m *MergeEngine) applyDelta(ctx context.Context, tx pgx.Tx, delta *engine.OverlayDelta, strategy Strategy) error {
 	var currentBaseRow map[string]interface{}
 	
-	// We assume 'id' is the primary key for MVP. 
-	// For a complete generic proxy, Chuck would need to query information_schema for the PK column.
+	// Dynamically discover primary key column
+	pkCol, err := m.getPrimaryKeyColumn(ctx, tx, delta.TableName)
+	if err != nil {
+		return err
+	}
 	
 	if delta.Operation == "UPDATE" || delta.Operation == "DELETE" {
 		// Lock the row and fetch its current state
-		lockQuery := fmt.Sprintf("SELECT row_to_json(t) FROM %s t WHERE id = $1 FOR UPDATE", delta.TableName)
+		lockQuery := fmt.Sprintf("SELECT row_to_json(t) FROM %s t WHERE %s = $1 FOR UPDATE", delta.TableName, pkCol)
 		var rowJSON []byte
 		err := tx.QueryRow(ctx, lockQuery, delta.RowID).Scan(&rowJSON)
 		if err != nil {
 			if err == pgx.ErrNoRows {
-				if strategy == StrategyStrict {
-					return fmt.Errorf("%w: row was deleted concurrently", ErrConflictStrict)
+				if strategy == StrategyStrict || strategy == StrategyGitStyle {
+					return ErrRowDeletedConcurrently
 				}
-				// If LastWriteWins, we can turn this UPDATE into an INSERT if the row is gone.
-				// But we need the full schema, which is complex. For now, fail.
-				return fmt.Errorf("row %d deleted concurrently, cannot apply %s", delta.RowID, delta.Operation)
+				// If LastWriteWins, we can theoretically turn this UPDATE into an INSERT if the row is gone.
+				// But we need the full schema, which is complex. For now, fail cleanly.
+				return fmt.Errorf("%w: row %d deleted concurrently, cannot apply %s", ErrRowDeletedConcurrently, delta.RowID, delta.Operation)
 			}
 			return fmt.Errorf("failed to lock row: %w", err)
 		}
@@ -127,13 +156,9 @@ func (m *MergeEngine) applyDelta(ctx context.Context, tx pgx.Tx, delta *engine.O
 	case "INSERT":
 		return m.executeInsert(ctx, tx, delta.TableName, afterValues)
 	case "UPDATE":
-		// Only update the modified columns (after conflict resolution, afterValues contains the merged result)
-		// Wait, afterValues contains the full row or just modified columns?
-		// In Chuck, overlay stores the specific subset or full row depending on WriteDelta.
-		// For MVP, if afterValues contains the full row, we update all. If it contains subset, we update subset.
-		return m.executeUpdate(ctx, tx, delta.TableName, delta.RowID, modifiedCols)
+		return m.executeUpdate(ctx, tx, delta.TableName, pkCol, delta.RowID, modifiedCols)
 	case "DELETE":
-		_, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE id = $1", delta.TableName), delta.RowID)
+		_, err := tx.Exec(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s = $1", delta.TableName, pkCol), delta.RowID)
 		return err
 	default:
 		return fmt.Errorf("unknown operation: %s", delta.Operation)
@@ -158,7 +183,7 @@ func (m *MergeEngine) executeInsert(ctx context.Context, tx pgx.Tx, tableName st
 	return err
 }
 
-func (m *MergeEngine) executeUpdate(ctx context.Context, tx pgx.Tx, tableName string, rowID int64, modifiedCols map[string]interface{}) error {
+func (m *MergeEngine) executeUpdate(ctx context.Context, tx pgx.Tx, tableName, pkCol string, rowID int64, modifiedCols map[string]interface{}) error {
 	if len(modifiedCols) == 0 {
 		return nil
 	}
@@ -174,7 +199,7 @@ func (m *MergeEngine) executeUpdate(ctx context.Context, tx pgx.Tx, tableName st
 	}
 	args = append(args, rowID)
 
-	query := fmt.Sprintf("UPDATE %s SET %s WHERE id = $%d", tableName, strings.Join(setClauses, ", "), i)
+	query := fmt.Sprintf("UPDATE %s SET %s WHERE %s = $%d", tableName, strings.Join(setClauses, ", "), pkCol, i)
 	_, err := tx.Exec(ctx, query, args...)
 	return err
 }

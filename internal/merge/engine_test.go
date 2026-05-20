@@ -32,6 +32,7 @@ func setupMergeTest(t *testing.T) (*pgxpool.Pool, *meta.Catalog, *engine.Overlay
 			score FLOAT
 		);
 		TRUNCATE test_merge_table;
+		DELETE FROM _chuck._chuck_branches;
 	`)
 	require.NoError(t, err)
 
@@ -191,4 +192,83 @@ func TestMergeEngine_LastWriteWins(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "inactive", status, "Status should be updated by branch")
 	assert.Equal(t, 99.9, score, "Score should be preserved from concurrent base update")
+}
+
+func TestMergeEngine_GitStyle(t *testing.T) {
+	pool, catalog, overlay, mergeEng := setupMergeTest(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	// 1. Seed base table
+	_, err := pool.Exec(ctx, "INSERT INTO test_merge_table (id, name, status, score) VALUES (1, 'base_record', 'active', 10.5)")
+	require.NoError(t, err)
+
+	// 2. Create Branch
+	branch, err := catalog.CreateBranch(ctx, "merge-test-git", nil)
+	require.NoError(t, err)
+
+	// 3. Write Delta modifying 'status'
+	err = overlay.WriteDelta(ctx, 
+		branch.ID, 
+		"test_merge_table", 
+		1, 
+		"default", 
+		"UPDATE", 
+		toJSON(t, map[string]interface{}{"status": "inactive"}), 
+		toJSON(t, map[string]interface{}{"id": 1, "name": "base_record", "status": "active", "score": 10.5}), 
+		toJSON(t, map[string]interface{}{"id": 1, "name": "base_record", "status": "inactive", "score": 10.5}),
+	)
+	require.NoError(t, err)
+
+	// 4. CONCURRENT MODIFICATION modifying 'score'
+	_, err = pool.Exec(ctx, "UPDATE test_merge_table SET score = 99.9 WHERE id = 1")
+	require.NoError(t, err)
+
+	// 5. Attempt Git-Style Merge (should succeed because modified columns do not overlap)
+	err = mergeEng.MergeBranch(ctx, branch.ID, merge.StrategyGitStyle)
+	require.NoError(t, err)
+
+	// 6. Verify Base Table
+	var status string
+	var score float64
+	err = pool.QueryRow(ctx, "SELECT status, score FROM test_merge_table WHERE id = 1").Scan(&status, &score)
+	require.NoError(t, err)
+	assert.Equal(t, "inactive", status, "Status should be updated by branch")
+	assert.Equal(t, 99.9, score, "Score should be preserved from concurrent base update")
+}
+
+func TestMergeEngine_GitStyleConflict(t *testing.T) {
+	pool, catalog, overlay, mergeEng := setupMergeTest(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	// 1. Seed base table
+	_, err := pool.Exec(ctx, "INSERT INTO test_merge_table (id, name, status, score) VALUES (1, 'base_record', 'active', 10.5)")
+	require.NoError(t, err)
+
+	// 2. Create Branch
+	branch, err := catalog.CreateBranch(ctx, "merge-test-git-conflict", nil)
+	require.NoError(t, err)
+
+	// 3. Write Delta modifying 'score'
+	err = overlay.WriteDelta(ctx, 
+		branch.ID, 
+		"test_merge_table", 
+		1, 
+		"default", 
+		"UPDATE", 
+		toJSON(t, map[string]interface{}{"score": 50.0}), 
+		toJSON(t, map[string]interface{}{"id": 1, "name": "base_record", "status": "active", "score": 10.5}), 
+		toJSON(t, map[string]interface{}{"id": 1, "name": "base_record", "status": "active", "score": 50.0}),
+	)
+	require.NoError(t, err)
+
+	// 4. CONCURRENT MODIFICATION modifying 'score'
+	_, err = pool.Exec(ctx, "UPDATE test_merge_table SET score = 99.9 WHERE id = 1")
+	require.NoError(t, err)
+
+	// 5. Attempt Git-Style Merge (should fail because both modified 'score')
+	err = mergeEng.MergeBranch(ctx, branch.ID, merge.StrategyGitStyle)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, merge.ErrConflictGit)
 }
