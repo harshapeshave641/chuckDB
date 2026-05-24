@@ -115,8 +115,10 @@ func (p *BranchProxy) listenForUpgrades() {
 			tbl := parts[1]
 
 			go func(schema, table string) {
+				log.Printf("Received notify upgrade for schema=%s, table=%s", schema, table)
 				db, err := sql.Open("pgx", p.UpstreamDSN)
 				if err != nil {
+					log.Printf("Failed to open DB in notification thread: %v", err)
 					return
 				}
 				defer db.Close()
@@ -130,27 +132,35 @@ func (p *BranchProxy) listenForUpgrades() {
 					WHERE b.schema_name = $1 AND t.table_name = $2
 				`, schema, table).Scan(&baseSchema)
 				if err != nil {
+					log.Printf("Failed to scan base schema for %s.%s: %v", schema, table, err)
 					return
 				}
 
 				cols, err := delta.InspectColumns(db, baseSchema, table)
 				if err != nil {
+					log.Printf("Failed to inspect columns for %s.%s: %v", baseSchema, table, err)
 					return
 				}
 
 				// Upgrade the view to overlay mode
 				err = delta.UpgradeToOverlay(db, schema, baseSchema, table, cols)
 				if err != nil {
+					log.Printf("Failed to upgrade view to overlay: %v", err)
 					return
 				}
 
 				// Update is_dirty flag & last_modified_at timestamp in metadata
-				_, _ = db.Exec(`
+				_, err = db.Exec(`
 					UPDATE chuck_meta.branch_tables 
 					SET is_dirty = true, last_modified_at = now()
 					WHERE branch_id = (SELECT id FROM chuck_meta.branches WHERE schema_name = $1)
 					  AND table_id = (SELECT id FROM chuck_meta.tracked_tables WHERE table_schema = $2 AND table_name = $3)
 				`, schema, baseSchema, table)
+				if err != nil {
+					log.Printf("Failed to update branch_tables metadata: %v", err)
+					return
+				}
+				log.Printf("Successfully upgraded %s.%s to overlay view.", schema, table)
 
 			}(branchSchema, tbl)
 		}

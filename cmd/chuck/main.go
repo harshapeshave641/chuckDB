@@ -438,7 +438,7 @@ var commitCmd = &cobra.Command{
 		var commitID string
 		err = db.QueryRow(`
 			INSERT INTO chuck_meta.commits (branch_id, parent_ids, message, author, delta_summary, row_inserts, row_updates, row_deletes)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			VALUES ($1, COALESCE($2, '{}'::uuid[]), $3, $4, $5, $6, $7, $8)
 			RETURNING id::text
 		`, branchID, parentIDs, commitMsg, author, summaryJSON, totalInserts, totalUpdates, totalDeletes).Scan(&commitID)
 		if err != nil {

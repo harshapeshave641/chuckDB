@@ -29,8 +29,8 @@ func Drop(db *sql.DB, branchName string) error {
 		return fmt.Errorf("failed to drop branch schema %s: %w", schemaName, err)
 	}
 
-	// Update metadata status to 'dropped' and record dropped_at time
-	_, err = tx.Exec("UPDATE chuck_meta.branches SET status = 'dropped', dropped_at = now() WHERE id = $1", id)
+	// Update metadata status to 'dropped' and record dropped_at time, renaming to free name/schema keys
+	_, err = tx.Exec("UPDATE chuck_meta.branches SET name = name || '_dropped_' || id, schema_name = schema_name || '_dropped_' || id, status = 'dropped', dropped_at = now() WHERE id = $1", id)
 	if err != nil {
 		return fmt.Errorf("failed to update branch metadata: %w", err)
 	}

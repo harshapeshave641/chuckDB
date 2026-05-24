@@ -467,7 +467,7 @@ func GenerateTriggerDDL(
 	sb.WriteString(beforeInsertTriggersStr)
 	
 	if idPK != "" {
-		sb.WriteString(fmt.Sprintf("        IF NEW.%s IS NULL THEN\n", idPK))
+		sb.WriteString(fmt.Sprintf("        IF NEW.%s IS NULL OR NOT EXISTS (SELECT 1 FROM %s.%s WHERE %s = NEW.%s) THEN\n", idPK, baseSchema, table, idPK, idPK))
 		sb.WriteString(fmt.Sprintf("            NEW.%s := nextval('%s.%s_id_seq');\n", idPK, branchSchema, table))
 		sb.WriteString("        END IF;\n")
 	}
