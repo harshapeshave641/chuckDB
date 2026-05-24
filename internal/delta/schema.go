@@ -523,12 +523,18 @@ func GenerateTriggerDDL(
 
 func generateCascadeDDL(sb *strings.Builder, branchSchema string, cascades []CascadeNode, parentPK string) {
 	for _, node := range cascades {
-		if strings.ToUpper(node.OnDelete) == "CASCADE" {
+		rule := strings.ToUpper(node.OnDelete)
+		if rule == "CASCADE" {
 			sb.WriteString(fmt.Sprintf("        -- CASCADE: %s.%s ON DELETE CASCADE\n", node.SourceTable, node.SourceColumn))
 			sb.WriteString(fmt.Sprintf("        DELETE FROM %s.%s WHERE %s = OLD.%s;\n\n", branchSchema, node.SourceTable, node.SourceColumn, parentPK))
-		} else if strings.ToUpper(node.OnDelete) == "SET NULL" {
+		} else if rule == "SET NULL" {
 			sb.WriteString(fmt.Sprintf("        -- CASCADE: %s.%s ON DELETE SET NULL\n", node.SourceTable, node.SourceColumn))
 			sb.WriteString(fmt.Sprintf("        UPDATE %s.%s SET %s = NULL WHERE %s = OLD.%s;\n\n", branchSchema, node.SourceTable, node.SourceColumn, node.SourceColumn, parentPK))
+		} else if rule == "RESTRICT" || rule == "NO ACTION" {
+			sb.WriteString(fmt.Sprintf("        -- RESTRICT: check if %s has rows referencing this\n", node.SourceTable))
+			sb.WriteString(fmt.Sprintf("        IF EXISTS (SELECT 1 FROM %s.%s WHERE %s = OLD.%s) THEN\n", branchSchema, node.SourceTable, node.SourceColumn, parentPK))
+			sb.WriteString(fmt.Sprintf("            RAISE EXCEPTION 'update or delete on table \"%s\" violates foreign key constraint on table \"%s\"' USING ERRCODE = '23503', DETAIL = 'Key is still referenced from table \"%s\".';\n", node.TargetTable, node.SourceTable, node.SourceTable))
+			sb.WriteString("        END IF;\n\n")
 		}
 	}
 }
