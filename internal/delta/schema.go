@@ -15,13 +15,14 @@ type ColumnDef struct {
 }
 
 type FKConstraint struct {
-	ConstraintName   string
-	SourceColumn     string
-	ReferencedSchema string
-	ReferencedTable  string
-	ReferencedColumn string
-	OnDelete         string // CASCADE, SET NULL, RESTRICT, NO ACTION, SET DEFAULT
-	OnUpdate         string
+	ConstraintName   string `json:"ConstraintName"`
+	SourceTable      string `json:"SourceTable"`
+	SourceColumn     string `json:"SourceColumn"`
+	ReferencedSchema string `json:"ReferencedSchema"`
+	ReferencedTable  string `json:"ReferencedTable"`
+	ReferencedColumn string `json:"ReferencedColumn"`
+	OnDelete         string `json:"OnDelete"` // CASCADE, SET NULL, RESTRICT, NO ACTION, SET DEFAULT
+	OnUpdate         string `json:"OnUpdate"`
 }
 
 type CascadeNode struct {
@@ -94,6 +95,7 @@ func InspectFKs(db *sql.DB, schema, table string) ([]FKConstraint, error) {
 	query := `
 		SELECT
 			tc.constraint_name,
+			tc.table_name AS source_table,
 			kcu.column_name AS source_column,
 			ccu.table_schema AS referenced_schema,
 			ccu.table_name AS referenced_table,
@@ -125,6 +127,7 @@ func InspectFKs(db *sql.DB, schema, table string) ([]FKConstraint, error) {
 		var fk FKConstraint
 		err := rows.Scan(
 			&fk.ConstraintName,
+			&fk.SourceTable,
 			&fk.SourceColumn,
 			&fk.ReferencedSchema,
 			&fk.ReferencedTable,
@@ -284,7 +287,11 @@ func GenerateDeltaTableDDL(branchSchema, table string, cols []ColumnDef, fks []F
 	
 	var pkCols []string
 	for _, col := range cols {
-		sb.WriteString(fmt.Sprintf("    %s %s,\n", col.Name, col.DataType))
+		defaultStr := ""
+		if col.Default != "" {
+			defaultStr = " DEFAULT " + col.Default
+		}
+		sb.WriteString(fmt.Sprintf("    %s %s%s,\n", col.Name, col.DataType, defaultStr))
 		if col.IsPrimary {
 			pkCols = append(pkCols, col.Name)
 		}
@@ -329,8 +336,16 @@ func GeneratePassthroughViewDDL(branchSchema, baseSchema, table string, cols []C
 		colNames = append(colNames, col.Name)
 	}
 	colsList := strings.Join(colNames, ", ")
-	return fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\nSELECT %s FROM %s.%s;\n", 
+	ddl := fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\nSELECT %s FROM %s.%s;\n", 
 		branchSchema, table, colsList, baseSchema, table)
+	
+	for _, col := range cols {
+		if col.Default != "" {
+			ddl += fmt.Sprintf("ALTER VIEW %s.%s ALTER COLUMN %s SET DEFAULT %s;\n", 
+				branchSchema, table, col.Name, col.Default)
+		}
+	}
+	return ddl
 }
 
 // GenerateOverlayViewDDL returns the UNION ALL merge view.
@@ -363,7 +378,7 @@ func GenerateOverlayViewDDL(branchSchema, baseSchema, table string, cols []Colum
 	}
 	joinStr := strings.Join(joinClauses, " AND ")
 	
-	return fmt.Sprintf(
+	ddl := fmt.Sprintf(
 		"CREATE OR REPLACE VIEW %s.%s AS\n"+
 		"SELECT %s\n"+
 		"FROM %s.%s b\n"+
@@ -374,6 +389,14 @@ func GenerateOverlayViewDDL(branchSchema, baseSchema, table string, cols []Colum
 		"FROM %s.%s_delta\n"+
 		"WHERE __deleted = false;\n",
 		branchSchema, table, bColsList, baseSchema, table, branchSchema, table, joinStr, pkFirst, colsList, branchSchema, table)
+
+	for _, col := range cols {
+		if col.Default != "" {
+			ddl += fmt.Sprintf("ALTER VIEW %s.%s ALTER COLUMN %s SET DEFAULT %s;\n", 
+				branchSchema, table, col.Name, col.Default)
+		}
+	}
+	return ddl
 }
 
 // GenerateTriggerDDL returns the full INSTEAD OF trigger DDL.
