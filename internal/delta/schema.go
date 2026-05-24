@@ -267,3 +267,257 @@ func classifyTrigger(body string) (bool, string) {
 	}
 	return true, ""
 }
+
+// GenerateDeltaTableDDL returns CREATE TABLE DDL for a branch delta table.
+func GenerateDeltaTableDDL(branchSchema, table string, cols []ColumnDef, fks []FKConstraint) string {
+	var sb strings.Builder
+	
+	if len(fks) > 0 {
+		sb.WriteString("-- Suspended FKs:\n")
+		for _, fk := range fks {
+			sb.WriteString(fmt.Sprintf("--   %s.%s → %s.%s.%s (%s)\n", 
+				table, fk.SourceColumn, fk.ReferencedSchema, fk.ReferencedTable, fk.ReferencedColumn, fk.OnDelete))
+		}
+	}
+	
+	sb.WriteString(fmt.Sprintf("CREATE TABLE %s.%s_delta (\n", branchSchema, table))
+	
+	var pkCols []string
+	for _, col := range cols {
+		sb.WriteString(fmt.Sprintf("    %s %s,\n", col.Name, col.DataType))
+		if col.IsPrimary {
+			pkCols = append(pkCols, col.Name)
+		}
+	}
+	
+	sb.WriteString("    __deleted BOOLEAN NOT NULL DEFAULT false,\n")
+	sb.WriteString("    __updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),\n")
+	sb.WriteString("    __is_new BOOLEAN NOT NULL DEFAULT false,\n")
+	sb.WriteString("    __branch_seq_id BIGINT")
+	
+	if len(pkCols) > 0 {
+		sb.WriteString(",\n")
+		sb.WriteString(fmt.Sprintf("    PRIMARY KEY (%s)", strings.Join(pkCols, ", ")))
+	}
+	sb.WriteString("\n);\n")
+
+	// Generate indexes
+	if len(pkCols) > 0 {
+		sb.WriteString(fmt.Sprintf("CREATE INDEX ON %s.%s_delta (%s);\n", branchSchema, table, strings.Join(pkCols, ", ")))
+	}
+	sb.WriteString(fmt.Sprintf("CREATE INDEX ON %s.%s_delta (__deleted) WHERE __deleted = false;\n", branchSchema, table))
+	sb.WriteString(fmt.Sprintf("CREATE INDEX ON %s.%s_delta (__is_new) WHERE __is_new = true;\n", branchSchema, table))
+	sb.WriteString(fmt.Sprintf("CREATE INDEX ON %s.%s_delta (__updated_at);\n", branchSchema, table))
+	
+	for _, fk := range fks {
+		sb.WriteString(fmt.Sprintf("CREATE INDEX ON %s.%s_delta (%s);\n", branchSchema, table, fk.SourceColumn))
+	}
+	
+	return sb.String()
+}
+
+// GenerateSequenceDDL returns CREATE SEQUENCE DDL for a branch-local sequence.
+func GenerateSequenceDDL(branchSchema, table string, branchID int64) string {
+	offset := 1000000000 * branchID
+	return fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s.%s_id_seq START WITH %d;\n", branchSchema, table, offset)
+}
+
+// GeneratePassthroughViewDDL returns a simple SELECT * FROM base view.
+func GeneratePassthroughViewDDL(branchSchema, baseSchema, table string, cols []ColumnDef) string {
+	var colNames []string
+	for _, col := range cols {
+		colNames = append(colNames, col.Name)
+	}
+	colsList := strings.Join(colNames, ", ")
+	return fmt.Sprintf("CREATE OR REPLACE VIEW %s.%s AS\nSELECT %s FROM %s.%s;\n", 
+		branchSchema, table, colsList, baseSchema, table)
+}
+
+// GenerateOverlayViewDDL returns the UNION ALL merge view.
+func GenerateOverlayViewDDL(branchSchema, baseSchema, table string, cols []ColumnDef) string {
+	var colNames []string
+	var bColNames []string
+	var pkCols []string
+	var pkFirst string
+	for _, col := range cols {
+		colNames = append(colNames, col.Name)
+		bColNames = append(bColNames, "b."+col.Name)
+		if col.IsPrimary {
+			pkCols = append(pkCols, col.Name)
+			if pkFirst == "" {
+				pkFirst = col.Name
+			}
+		}
+	}
+	if pkFirst == "" {
+		pkFirst = "id"
+		pkCols = []string{"id"}
+	}
+	
+	colsList := strings.Join(colNames, ", ")
+	bColsList := strings.Join(bColNames, ", ")
+	
+	var joinClauses []string
+	for _, pk := range pkCols {
+		joinClauses = append(joinClauses, fmt.Sprintf("b.%s = d.%s", pk, pk))
+	}
+	joinStr := strings.Join(joinClauses, " AND ")
+	
+	return fmt.Sprintf(
+		"CREATE OR REPLACE VIEW %s.%s AS\n"+
+		"SELECT %s\n"+
+		"FROM %s.%s b\n"+
+		"LEFT JOIN %s.%s_delta d ON %s\n"+
+		"WHERE d.%s IS NULL\n"+
+		"UNION ALL\n"+
+		"SELECT %s\n"+
+		"FROM %s.%s_delta\n"+
+		"WHERE __deleted = false;\n",
+		branchSchema, table, bColsList, baseSchema, table, branchSchema, table, joinStr, pkFirst, colsList, branchSchema, table)
+}
+
+// GenerateTriggerDDL returns the full INSTEAD OF trigger DDL.
+func GenerateTriggerDDL(
+	branchSchema, baseSchema, table string,
+	cols []ColumnDef,
+	cascades []CascadeNode,
+	replicableTriggers []BaseTrigger,
+) string {
+	var sb strings.Builder
+	
+	var firstPK string
+	var idPK string
+	var colNames []string
+	var valPlaceholders []string
+	var pkCols []string
+	var updateSets []string
+	
+	for _, col := range cols {
+		colNames = append(colNames, col.Name)
+		valPlaceholders = append(valPlaceholders, "NEW."+col.Name)
+		if col.IsPrimary {
+			pkCols = append(pkCols, col.Name)
+			if firstPK == "" {
+				firstPK = col.Name
+			}
+			if strings.ToLower(col.Name) == "id" {
+				idPK = col.Name
+			}
+		} else {
+			updateSets = append(updateSets, fmt.Sprintf("%s = EXCLUDED.%s", col.Name, col.Name))
+		}
+	}
+	
+	if firstPK == "" {
+		firstPK = "id"
+		pkCols = []string{"id"}
+	}
+	
+	colsList := strings.Join(colNames, ", ")
+	valsList := strings.Join(valPlaceholders, ", ")
+	pksCSV := strings.Join(pkCols, ", ")
+	
+	updateSetsList := strings.Join(updateSets, ", ")
+	if updateSetsList != "" {
+		updateSetsList += ", "
+	}
+	
+	var beforeInsertTriggersStr string
+	var beforeUpdateTriggersStr string
+	for _, trg := range replicableTriggers {
+		if strings.Contains(trg.Timing, "BEFORE") {
+			if strings.Contains(strings.ToLower(trg.FunctionBody), "updated_at") {
+				beforeUpdateTriggersStr += "        NEW.updated_at := now();\n"
+			}
+			if strings.Contains(strings.ToLower(trg.FunctionBody), "created_at") {
+				beforeInsertTriggersStr += "        NEW.created_at := now();\n"
+			}
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf("CREATE OR REPLACE FUNCTION %s.%s_trigger_fn()\n", branchSchema, table))
+	sb.WriteString("RETURNS trigger LANGUAGE plpgsql AS $$\n")
+	sb.WriteString("BEGIN\n")
+	
+	// INSERT PATH
+	sb.WriteString("    IF TG_OP = 'INSERT' THEN\n")
+	sb.WriteString(beforeInsertTriggersStr)
+	
+	if idPK != "" {
+		sb.WriteString(fmt.Sprintf("        IF NEW.%s IS NULL THEN\n", idPK))
+		sb.WriteString(fmt.Sprintf("            NEW.%s := nextval('%s.%s_id_seq');\n", idPK, branchSchema, table))
+		sb.WriteString("        END IF;\n")
+	}
+	
+	sb.WriteString(fmt.Sprintf("        INSERT INTO %s.%s_delta\n", branchSchema, table))
+	sb.WriteString(fmt.Sprintf("            (%s, __deleted, __updated_at, __is_new, __branch_seq_id)\n", colsList))
+	sb.WriteString(fmt.Sprintf("        VALUES (%s, false, now(), true, NEW.%s)\n", valsList, firstPK))
+	sb.WriteString(fmt.Sprintf("        ON CONFLICT (%s) DO UPDATE SET\n", pksCSV))
+	sb.WriteString(fmt.Sprintf("            %s__deleted = false, __updated_at = now();\n", updateSetsList))
+	sb.WriteString(fmt.Sprintf("        PERFORM pg_notify('chuck_write', '%s.%s');\n", branchSchema, table))
+	sb.WriteString("        RETURN NEW;\n\n")
+	
+	// UPDATE PATH
+	sb.WriteString("    ELSIF TG_OP = 'UPDATE' THEN\n")
+	sb.WriteString(beforeUpdateTriggersStr)
+	sb.WriteString(fmt.Sprintf("        INSERT INTO %s.%s_delta\n", branchSchema, table))
+	sb.WriteString(fmt.Sprintf("            (%s, __deleted, __updated_at, __is_new, __branch_seq_id)\n", colsList))
+	sb.WriteString(fmt.Sprintf("        VALUES (%s, false, now(), false, NULL)\n", valsList))
+	sb.WriteString(fmt.Sprintf("        ON CONFLICT (%s) DO UPDATE SET\n", pksCSV))
+	sb.WriteString(fmt.Sprintf("            %s__deleted = false, __updated_at = now();\n", updateSetsList))
+	sb.WriteString(fmt.Sprintf("        PERFORM pg_notify('chuck_write', '%s.%s');\n", branchSchema, table))
+	sb.WriteString("        RETURN NEW;\n\n")
+	
+	// DELETE PATH
+	sb.WriteString("    ELSIF TG_OP = 'DELETE' THEN\n")
+	sb.WriteString(fmt.Sprintf("        -- Tombstone %s\n", table))
+	
+	var oldPkVals []string
+	for _, pk := range pkCols {
+		oldPkVals = append(oldPkVals, "OLD."+pk)
+	}
+	oldPkValsCSV := strings.Join(oldPkVals, ", ")
+	
+	sb.WriteString(fmt.Sprintf("        INSERT INTO %s.%s_delta (%s, __deleted, __updated_at)\n", branchSchema, table, pksCSV))
+	sb.WriteString(fmt.Sprintf("        VALUES (%s, true, now())\n", oldPkValsCSV))
+	sb.WriteString(fmt.Sprintf("        ON CONFLICT (%s) DO UPDATE SET __deleted = true, __updated_at = now();\n\n", pksCSV))
+	
+	// CASCADE logic in delete path
+	generateCascadeDDL(&sb, branchSchema, cascades, firstPK)
+	
+	sb.WriteString(fmt.Sprintf("        PERFORM pg_notify('chuck_write', '%s.%s');\n", branchSchema, table))
+	sb.WriteString("        RETURN OLD;\n")
+	sb.WriteString("    END IF;\n")
+	sb.WriteString("END;\n")
+	sb.WriteString("$$;\n\n")
+	
+	sb.WriteString(fmt.Sprintf("CREATE OR REPLACE TRIGGER %s_instead_of\n", table))
+	sb.WriteString(fmt.Sprintf("INSTEAD OF INSERT OR UPDATE OR DELETE ON %s.%s\n", branchSchema, table))
+	sb.WriteString(fmt.Sprintf("FOR EACH ROW EXECUTE FUNCTION %s.%s_trigger_fn();\n", branchSchema, table))
+	
+	return sb.String()
+}
+
+func generateCascadeDDL(sb *strings.Builder, branchSchema string, cascades []CascadeNode, parentPK string) {
+	for _, node := range cascades {
+		if strings.ToUpper(node.OnDelete) == "CASCADE" {
+			sb.WriteString(fmt.Sprintf("        -- CASCADE: %s.%s ON DELETE CASCADE\n", node.SourceTable, node.SourceColumn))
+			sb.WriteString(fmt.Sprintf("        INSERT INTO %s.%s_delta (id, __deleted, __updated_at)\n", branchSchema, node.SourceTable))
+			sb.WriteString(fmt.Sprintf("        SELECT o.id, true, now()\n"))
+			sb.WriteString(fmt.Sprintf("        FROM %s.%s o\n", branchSchema, node.SourceTable))
+			sb.WriteString(fmt.Sprintf("        WHERE o.%s = OLD.%s\n", node.SourceColumn, parentPK))
+			sb.WriteString(fmt.Sprintf("        ON CONFLICT (id) DO UPDATE SET __deleted = true, __updated_at = now();\n\n"))
+		} else if strings.ToUpper(node.OnDelete) == "SET NULL" {
+			sb.WriteString(fmt.Sprintf("        -- CASCADE: %s.%s ON DELETE SET NULL\n", node.SourceTable, node.SourceColumn))
+			sb.WriteString(fmt.Sprintf("        INSERT INTO %s.%s_delta (id, %s, __deleted, __updated_at, __is_new)\n", branchSchema, node.SourceTable, node.SourceColumn))
+			sb.WriteString(fmt.Sprintf("        SELECT o.id, NULL, false, now(), false\n"))
+			sb.WriteString(fmt.Sprintf("        FROM %s.%s o\n", branchSchema, node.SourceTable))
+			sb.WriteString(fmt.Sprintf("        WHERE o.%s = OLD.%s\n", node.SourceColumn, parentPK))
+			sb.WriteString(fmt.Sprintf("        ON CONFLICT (id) DO UPDATE SET %s = NULL, __deleted = false, __updated_at = now();\n\n", node.SourceColumn))
+		}
+		
+		if len(node.Children) > 0 {
+			generateCascadeDDL(sb, branchSchema, node.Children, "id")
+		}
+	}
+}

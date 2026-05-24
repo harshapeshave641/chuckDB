@@ -160,3 +160,82 @@ func TestSchemaInspection(t *testing.T) {
 	}
 }
 
+func TestDDLGenerationAndExecution(t *testing.T) {
+	db := getTestDB(t)
+	defer db.Close()
+	setupTestTables(t, db)
+
+	cols, err := delta.InspectColumns(db, "chuck_test", "users")
+	if err != nil {
+		t.Fatalf("failed to inspect columns: %v", err)
+	}
+
+	fks, err := delta.InspectFKs(db, "chuck_test", "users")
+	if err != nil {
+		t.Fatalf("failed to inspect FKs: %v", err)
+	}
+
+	branchSchema := "chuck_branch_test"
+	_, _ = db.Exec("DROP SCHEMA IF EXISTS " + branchSchema + " CASCADE")
+	_, err = db.Exec("CREATE SCHEMA " + branchSchema)
+	if err != nil {
+		t.Fatalf("failed to create branch schema: %v", err)
+	}
+
+	// 1. Delta Table DDL
+	deltaDDL := delta.GenerateDeltaTableDDL(branchSchema, "users", cols, fks)
+	if _, err := db.Exec(deltaDDL); err != nil {
+		t.Fatalf("executing delta DDL failed: %v\nDDL:\n%s", err, deltaDDL)
+	}
+
+	// 2. Sequence DDL
+	seqDDL := delta.GenerateSequenceDDL(branchSchema, "users", 1)
+	if _, err := db.Exec(seqDDL); err != nil {
+		t.Fatalf("executing sequence DDL failed: %v\nDDL:\n%s", err, seqDDL)
+	}
+
+	// 3. Passthrough View DDL
+	passViewDDL := delta.GeneratePassthroughViewDDL(branchSchema, "chuck_test", "users", cols)
+	if _, err := db.Exec(passViewDDL); err != nil {
+		t.Fatalf("executing passthrough view DDL failed: %v\nDDL:\n%s", err, passViewDDL)
+	}
+
+	// 4. Trigger DDL
+	triggers, _ := delta.InspectTriggers(db, "chuck_test", "users")
+	var replicable []delta.BaseTrigger
+	for _, trg := range triggers {
+		if trg.Replicable {
+			replicable = append(replicable, trg)
+		}
+	}
+	
+	graph, _ := delta.BuildCascadeGraph(db, "chuck_test", "users")
+
+	// Setup orders delta and view for cascade
+	ordersCols, _ := delta.InspectColumns(db, "chuck_test", "orders")
+	ordersFKs, _ := delta.InspectFKs(db, "chuck_test", "orders")
+	_, err = db.Exec(delta.GenerateDeltaTableDDL(branchSchema, "orders", ordersCols, ordersFKs))
+	if err != nil {
+		t.Fatalf("failed to setup orders delta table: %v", err)
+	}
+	_, err = db.Exec(delta.GeneratePassthroughViewDDL(branchSchema, "chuck_test", "orders", ordersCols))
+	if err != nil {
+		t.Fatalf("failed to setup orders view: %v", err)
+	}
+
+	triggerDDL := delta.GenerateTriggerDDL(branchSchema, "chuck_test", "users", cols, graph, replicable)
+	if _, err := db.Exec(triggerDDL); err != nil {
+		t.Fatalf("executing trigger DDL failed: %v\nDDL:\n%s", err, triggerDDL)
+	}
+
+	// 5. Test view swap upgrade/downgrade
+	err = delta.UpgradeToOverlay(db, branchSchema, "chuck_test", "users", cols)
+	if err != nil {
+		t.Fatalf("UpgradeToOverlay failed: %v", err)
+	}
+
+	err = delta.DowngradeToPassthrough(db, branchSchema, "chuck_test", "users", cols)
+	if err != nil {
+		t.Fatalf("DowngradeToPassthrough failed: %v", err)
+	}
+}
