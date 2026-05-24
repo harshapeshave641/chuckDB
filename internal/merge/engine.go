@@ -10,7 +10,7 @@ import (
 )
 
 // Merge executes the full merge pipeline inside a SERIALIZABLE transaction.
-func Merge(db *sql.DB, branchName string, dryRun bool) error {
+func Merge(db *sql.DB, branchName string, dryRun bool) (mergeErr error) {
 	ctx := context.Background()
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
@@ -19,9 +19,21 @@ func Merge(db *sql.DB, branchName string, dryRun bool) error {
 	defer tx.Rollback()
 
 	startTime := time.Now()
+	var branchID int64
+	var fkViolationsJSON []byte
+	var conflictSummaryJSON []byte
+
+	// Record any failure outside the transaction block so it persists after rollback
+	defer func() {
+		if mergeErr != nil && branchID != 0 {
+			_, _ = db.Exec(`
+				INSERT INTO chuck_meta.merge_history (branch_id, success, fk_violations, conflict_summary, error_message, duration_ms)
+				VALUES ($1, false, $2, $3, $4, $5)
+			`, branchID, fkViolationsJSON, conflictSummaryJSON, mergeErr.Error(), time.Since(startTime).Milliseconds())
+		}
+	}()
 
 	// 1. Fetch branch metadata
-	var branchID int64
 	var schemaName string
 	var status string
 	err = tx.QueryRow(`
@@ -38,6 +50,40 @@ func Merge(db *sql.DB, branchName string, dryRun bool) error {
 
 	if status == "merged" {
 		return fmt.Errorf("branch %q is already merged", branchName)
+	}
+
+	if status == "locked" {
+		// Check for stale lock (> 30 mins)
+		var lockedAt time.Time
+		err = tx.QueryRow(`
+			SELECT locked_at 
+			FROM chuck_meta.branches 
+			WHERE id = $1
+		`, branchID).Scan(&lockedAt)
+		if err == nil && time.Since(lockedAt) > 30*time.Minute {
+			// Break stale lock
+			_, err = tx.Exec(`
+				UPDATE chuck_meta.branches 
+				SET status = 'active', locked_by = NULL, locked_at = NULL 
+				WHERE id = $1
+			`, branchID)
+			if err != nil {
+				return fmt.Errorf("failed to break stale lock: %w", err)
+			}
+			status = "active"
+		} else {
+			return fmt.Errorf("branch %q is locked (merge in progress)", branchName)
+		}
+	}
+
+	// Lock the branch
+	_, err = tx.Exec(`
+		UPDATE chuck_meta.branches 
+		SET status = 'locked', locked_by = 'merge-process', locked_at = now() 
+		WHERE id = $1
+	`, branchID)
+	if err != nil {
+		return fmt.Errorf("failed to lock branch: %w", err)
 	}
 
 	// 2. Fetch suspended FKs and tracked tables
@@ -80,14 +126,8 @@ func Merge(db *sql.DB, branchName string, dryRun bool) error {
 		return fmt.Errorf("FK validation failed: %w", err)
 	}
 	if len(violations) > 0 {
-		violationsJSON, _ := json.Marshal(violations)
-		// Record failed merge in history
-		_, _ = tx.Exec(`
-			INSERT INTO chuck_meta.merge_history (branch_id, success, fk_violations, error_message, duration_ms)
-			VALUES ($1, false, $2, 'FK violations detected', $3)
-		`, branchID, violationsJSON, time.Since(startTime).Milliseconds())
-		
-		return fmt.Errorf("FK violations detected: %s", string(violationsJSON))
+		fkViolationsJSON, _ = json.Marshal(violations)
+		return fmt.Errorf("FK violations detected: %s", string(fkViolationsJSON))
 	}
 
 	// 4. Conflict Detection
@@ -96,13 +136,8 @@ func Merge(db *sql.DB, branchName string, dryRun bool) error {
 		return fmt.Errorf("conflict detection failed: %w", err)
 	}
 	if len(conflicts) > 0 {
-		conflictsJSON, _ := json.Marshal(conflicts)
-		_, _ = tx.Exec(`
-			INSERT INTO chuck_meta.merge_history (branch_id, success, conflict_summary, error_message, duration_ms)
-			VALUES ($1, false, $2, 'Concurrent modification conflicts detected', $3)
-		`, branchID, conflictsJSON, time.Since(startTime).Milliseconds())
-
-		return fmt.Errorf("conflicts detected: %s", string(conflictsJSON))
+		conflictSummaryJSON, _ = json.Marshal(conflicts)
+		return fmt.Errorf("conflicts detected: %s", string(conflictSummaryJSON))
 	}
 
 	if dryRun {
@@ -231,7 +266,7 @@ func Merge(db *sql.DB, branchName string, dryRun bool) error {
 		return fmt.Errorf("failed to record merge history: %w", err)
 	}
 
-	_, err = tx.Exec("UPDATE chuck_meta.branches SET status = 'merged', merged_at = now() WHERE id = $1", branchID)
+	_, err = tx.Exec("UPDATE chuck_meta.branches SET status = 'merged', merged_at = now(), locked_by = NULL, locked_at = NULL WHERE id = $1", branchID)
 	if err != nil {
 		return fmt.Errorf("failed to update branch metadata: %w", err)
 	}
