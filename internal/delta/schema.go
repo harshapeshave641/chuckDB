@@ -35,12 +35,12 @@ type CascadeNode struct {
 }
 
 type BaseTrigger struct {
-	Name         string
-	Event        string // INSERT, UPDATE, DELETE
-	Timing       string // BEFORE, AFTER
-	FunctionBody string
-	Replicable   bool
-	SkipReason   string
+	Name         string `json:"name"`
+	Event        string `json:"event"`
+	Timing       string `json:"timing"`
+	FunctionBody string `json:"function_body"`
+	Replicable   bool   `json:"replicable"`
+	SkipReason   string `json:"skip_reason"`
 }
 
 // InspectColumns returns all columns for a table including PK info.
@@ -267,6 +267,15 @@ func classifyTrigger(body string) (bool, string) {
 	}
 	if strings.Contains(bodyLower, "pg_net") {
 		return false, "references pg_net"
+	}
+	if strings.Contains(bodyLower, "insert into") {
+		return false, "performs insert side-effects"
+	}
+	if strings.Contains(bodyLower, "update ") {
+		return false, "performs update side-effects"
+	}
+	if strings.Contains(bodyLower, "delete ") {
+		return false, "performs delete side-effects"
 	}
 	return true, ""
 }
