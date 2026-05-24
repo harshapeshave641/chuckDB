@@ -525,22 +525,10 @@ func generateCascadeDDL(sb *strings.Builder, branchSchema string, cascades []Cas
 	for _, node := range cascades {
 		if strings.ToUpper(node.OnDelete) == "CASCADE" {
 			sb.WriteString(fmt.Sprintf("        -- CASCADE: %s.%s ON DELETE CASCADE\n", node.SourceTable, node.SourceColumn))
-			sb.WriteString(fmt.Sprintf("        INSERT INTO %s.%s_delta (id, __deleted, __updated_at)\n", branchSchema, node.SourceTable))
-			sb.WriteString(fmt.Sprintf("        SELECT o.id, true, now()\n"))
-			sb.WriteString(fmt.Sprintf("        FROM %s.%s o\n", branchSchema, node.SourceTable))
-			sb.WriteString(fmt.Sprintf("        WHERE o.%s = OLD.%s\n", node.SourceColumn, parentPK))
-			sb.WriteString(fmt.Sprintf("        ON CONFLICT (id) DO UPDATE SET __deleted = true, __updated_at = now();\n\n"))
+			sb.WriteString(fmt.Sprintf("        DELETE FROM %s.%s WHERE %s = OLD.%s;\n\n", branchSchema, node.SourceTable, node.SourceColumn, parentPK))
 		} else if strings.ToUpper(node.OnDelete) == "SET NULL" {
 			sb.WriteString(fmt.Sprintf("        -- CASCADE: %s.%s ON DELETE SET NULL\n", node.SourceTable, node.SourceColumn))
-			sb.WriteString(fmt.Sprintf("        INSERT INTO %s.%s_delta (id, %s, __deleted, __updated_at, __is_new)\n", branchSchema, node.SourceTable, node.SourceColumn))
-			sb.WriteString(fmt.Sprintf("        SELECT o.id, NULL, false, now(), false\n"))
-			sb.WriteString(fmt.Sprintf("        FROM %s.%s o\n", branchSchema, node.SourceTable))
-			sb.WriteString(fmt.Sprintf("        WHERE o.%s = OLD.%s\n", node.SourceColumn, parentPK))
-			sb.WriteString(fmt.Sprintf("        ON CONFLICT (id) DO UPDATE SET %s = NULL, __deleted = false, __updated_at = now();\n\n", node.SourceColumn))
-		}
-		
-		if len(node.Children) > 0 {
-			generateCascadeDDL(sb, branchSchema, node.Children, "id")
+			sb.WriteString(fmt.Sprintf("        UPDATE %s.%s SET %s = NULL WHERE %s = OLD.%s;\n\n", branchSchema, node.SourceTable, node.SourceColumn, node.SourceColumn, parentPK))
 		}
 	}
 }

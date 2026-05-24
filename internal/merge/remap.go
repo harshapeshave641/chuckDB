@@ -14,6 +14,18 @@ func RemapNewRows(tx *sql.Tx, branchSchema string, tables []string) (map[string]
 	for _, tbl := range tables {
 		remaps[tbl] = make(map[int64]int64)
 
+		// Check if table has an 'id' column
+		var hasID bool
+		err := tx.QueryRow(`
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns 
+				WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'id'
+			)
+		`, tbl).Scan(&hasID)
+		if err != nil || !hasID {
+			continue
+		}
+
 		query := fmt.Sprintf("SELECT id FROM %s.%s_delta WHERE __is_new = true ORDER BY id ASC", branchSchema, tbl)
 		rows, err := tx.Query(query)
 		if err != nil {
@@ -34,11 +46,21 @@ func RemapNewRows(tx *sql.Tx, branchSchema string, tables []string) (map[string]
 			continue
 		}
 
+		// Resolve sequence name (serial or custom default nextval)
 		var seqName sql.NullString
-		_ = tx.QueryRow("SELECT pg_get_serial_sequence($1, 'id')", "public."+tbl).Scan(&seqName)
+		err = tx.QueryRow(`
+			SELECT COALESCE(
+				pg_get_serial_sequence($1, 'id'),
+				(
+					SELECT (regexp_match(column_default, 'nextval\(''([^'']+)'''))[1]
+					FROM information_schema.columns
+					WHERE table_schema = 'public' AND table_name = $2 AND column_name = 'id'
+				)
+			)
+		`, "public."+tbl, tbl).Scan(&seqName)
 
 		actualSeq := "public." + tbl + "_id_seq"
-		if seqName.Valid && seqName.String != "" {
+		if err == nil && seqName.Valid && seqName.String != "" {
 			actualSeq = seqName.String
 		}
 
