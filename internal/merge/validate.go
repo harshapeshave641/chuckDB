@@ -19,10 +19,44 @@ func ValidateFKs(tx *sql.Tx, branchSchema string, suspendedFKs []FKConstraint) (
 	var violations []FKViolation
 
 	for _, fk := range suspendedFKs {
-		// We query the delta table for violating rows, checking if the referenced key
-		// exists in the branch view (which represents base + delta combined state).
+		var pks []string
+		var pksJSON string
+		err := tx.QueryRow(`
+			SELECT array_to_json(primary_keys)
+			FROM chuck_meta.tracked_tables
+			WHERE table_name = $1
+		`, fk.SourceTable).Scan(&pksJSON)
+		if err == nil && pksJSON != "" {
+			_ = json.Unmarshal([]byte(pksJSON), &pks)
+		}
+
+		var selectExpr string
+		if len(pks) > 0 {
+			if len(pks) == 1 {
+				selectExpr = fmt.Sprintf("source.%s", pks[0])
+			} else {
+				var concatParts []string
+				for i, pk := range pks {
+					if i > 0 {
+						concatParts = append(concatParts, "','")
+					}
+					concatParts = append(concatParts, fmt.Sprintf("'%s:', source.%s", pk, pk))
+				}
+				var sqlParts string
+				for idx, part := range concatParts {
+					if idx > 0 {
+						sqlParts += ", "
+					}
+					sqlParts += part
+				}
+				selectExpr = fmt.Sprintf("CONCAT(%s)", sqlParts)
+			}
+		} else {
+			selectExpr = fmt.Sprintf("source.%s", fk.SourceColumn)
+		}
+
 		query := fmt.Sprintf(`
-			SELECT source.id
+			SELECT %s
 			FROM %s.%s_delta source
 			WHERE source.__deleted = false
 			  AND source.%s IS NOT NULL
@@ -30,7 +64,7 @@ func ValidateFKs(tx *sql.Tx, branchSchema string, suspendedFKs []FKConstraint) (
 				  SELECT 1 FROM %s.%s ref
 				  WHERE ref.%s = source.%s
 			  )
-		`, branchSchema, fk.SourceTable, fk.SourceColumn, branchSchema, fk.ReferencedTable, fk.ReferencedColumn, fk.SourceColumn)
+		`, selectExpr, branchSchema, fk.SourceTable, fk.SourceColumn, branchSchema, fk.ReferencedTable, fk.ReferencedColumn, fk.SourceColumn)
 
 		rows, err := tx.Query(query)
 		if err != nil {
@@ -40,9 +74,12 @@ func ValidateFKs(tx *sql.Tx, branchSchema string, suspendedFKs []FKConstraint) (
 
 		var violatingIDs []interface{}
 		for rows.Next() {
-			var id int64
-			if err := rows.Scan(&id); err == nil {
-				violatingIDs = append(violatingIDs, id)
+			var val interface{}
+			if err := rows.Scan(&val); err == nil {
+				if bytes, ok := val.([]byte); ok {
+					val = string(bytes)
+				}
+				violatingIDs = append(violatingIDs, val)
 			}
 		}
 		rows.Close()
