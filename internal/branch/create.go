@@ -159,7 +159,7 @@ func Create(db *sql.DB, branchName string) error {
 		// Marshal JSON fields for metadata
 		fksJSON, _ := json.Marshal(fks)
 		cascadesJSON, _ := json.Marshal(cascades)
-		triggersJSON, _ := json.Marshal(replicableTriggers)
+		triggersJSON, _ := json.Marshal(triggers)
 
 		// Insert into chuck_meta.branch_tables
 		_, err = tx.Exec(`
