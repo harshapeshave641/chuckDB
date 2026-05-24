@@ -16,6 +16,9 @@ func Create(db *sql.DB, branchName string) error {
 	if !branchNameRegex.MatchString(branchName) {
 		return fmt.Errorf("invalid branch name: must be alphanumeric and underscores only")
 	}
+	if len(branchName) > 57 {
+		return fmt.Errorf("branch name %q too long: maximum is 57 characters", branchName)
+	}
 
 	// Begin transaction
 	tx, err := db.Begin()
