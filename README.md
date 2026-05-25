@@ -7,7 +7,7 @@ ChuckDB is a Postgres-native database branching tool designed for single-active-
 ## Architecture Overview
 
 ChuckDB virtualizes database branches by keeping a single active branch context. All writes to the active branch are routed into branch-specific delta tables (`chuck_{branch_name}.{table}_delta`), and reads query combined passthrough or overlay views. A lightweight TCP proxy ensures your application queries are automatically routed with the correct schema `search_path` dynamically.
-
+ 
 ---
 
 ## Installation & Setup
