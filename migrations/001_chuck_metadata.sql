@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS chuck_meta.branches (
 
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     merged_at        TIMESTAMPTZ,
-    dropped_at       TIMESTAMPTZ
+    dropped_at       TIMESTAMPTZ,
+    last_conflict    TIMESTAMPZ
 );
 
 CREATE TABLE IF NOT EXISTS chuck_meta.tracked_tables (
